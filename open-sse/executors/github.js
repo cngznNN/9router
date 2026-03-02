@@ -123,8 +123,8 @@ export class GithubExecutor extends BaseExecutor {
 
   /**
    * Truncate messages to fit within the context limit
-   * Strategy: Keep system messages, always keep first and last user messages,
-   * and progressively remove older messages from the middle
+   * Strategy: Sliding window - keep system messages + most recent messages
+   * This prevents the model from seeing old context and repeating itself
    */
   truncateMessagesToFitLimit(body, log) {
     if (!body?.messages) return body;
@@ -142,17 +142,9 @@ export class GithubExecutor extends BaseExecutor {
     const systemMessages = messages.filter(m => m.role === "system");
     const regularMessages = messages.filter(m => m.role !== "system");
 
-    // We'll keep: all system messages + truncated regular messages
-    // Strategy: Keep first user message and last N messages that fit
+    // Sliding window: keep most recent messages that fit
     let truncated = [];
     let currentTokens = systemMessages.reduce((sum, m) => sum + this.estimateMessageTokens(m), 0);
-
-    // Always keep the first user message (usually contains the main request)
-    const firstUserMsg = regularMessages.find(m => m.role === "user");
-    if (firstUserMsg) {
-      truncated.push(firstUserMsg);
-      currentTokens += this.estimateMessageTokens(firstUserMsg);
-    }
 
     // Add messages from the end until we approach the limit
     // Leave some buffer for safety
@@ -160,8 +152,6 @@ export class GithubExecutor extends BaseExecutor {
 
     for (let i = regularMessages.length - 1; i >= 0; i--) {
       const msg = regularMessages[i];
-      if (msg === firstUserMsg) continue; // Skip if we already added it
-
       const msgTokens = this.estimateMessageTokens(msg);
 
       if (currentTokens + msgTokens <= targetTokens) {
@@ -232,7 +222,7 @@ export class GithubExecutor extends BaseExecutor {
   }
 
   /**
-   * Aggressive truncation: keep only system + first user + last 10 messages
+   * Aggressive truncation: keep only system + last 10 messages
    * Used as fallback when initial truncation wasn't enough
    */
   aggressiveTruncate(body, log) {
@@ -242,16 +232,8 @@ export class GithubExecutor extends BaseExecutor {
     const systemMessages = messages.filter(m => m.role === "system");
     const regularMessages = messages.filter(m => m.role !== "system");
 
-    const firstUser = regularMessages.find(m => m.role === "user");
     const lastMessages = regularMessages.slice(-10);
-
-    // Ensure we don't add firstUser twice
-    let result;
-    if (firstUser && !lastMessages.includes(firstUser)) {
-      result = [...systemMessages, firstUser, ...lastMessages];
-    } else {
-      result = [...systemMessages, ...lastMessages];
-    }
+    const result = [...systemMessages, ...lastMessages];
 
     log?.warn("GITHUB", `Aggressive truncation: ${messages.length} → ${result.length} messages`);
 
