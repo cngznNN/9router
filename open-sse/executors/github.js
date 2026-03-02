@@ -6,6 +6,15 @@ import { initState } from "../translator/index.js";
 import { parseSSELine, formatSSE } from "../utils/streamHelpers.js";
 import crypto from "crypto";
 
+// GitHub Copilot context limit: 128K tokens
+// We use a slightly lower limit to leave room for the response
+const GITHUB_CONTEXT_LIMIT = 128000;
+const CONTEXT_BUFFER = 8000; // Buffer for the response
+const MAX_ALLOWED_TOKENS = GITHUB_CONTEXT_LIMIT - CONTEXT_BUFFER;
+
+// Rough token estimation: ~4 characters per token
+const CHARS_PER_TOKEN = 4;
+
 export class GithubExecutor extends BaseExecutor {
   constructor() {
     super("github", PROVIDERS.github);
@@ -70,6 +79,111 @@ export class GithubExecutor extends BaseExecutor {
     return sanitized;
   }
 
+  /**
+   * Estimate token count for a message (rough approximation)
+   * Uses ~4 characters per token heuristic
+   */
+  estimateMessageTokens(message) {
+    const content = message.content;
+    let chars = 0;
+
+    if (typeof content === "string") {
+      chars = content.length;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === "text" && part.text) {
+          chars += part.text.length;
+        } else if (part.type === "image_url") {
+          // Base64 images: estimate based on data URL length
+          chars += (part.image_url?.url || "").length;
+        } else {
+          // Other content types: estimate from JSON size
+          chars += JSON.stringify(part).length;
+        }
+      }
+    }
+
+    // Add overhead for role, tool_calls, etc.
+    const overhead = JSON.stringify({
+      role: message.role,
+      tool_calls: message.tool_calls || [],
+      tool_call_id: message.tool_call_id || ""
+    }).length;
+
+    return Math.ceil((chars + overhead) / CHARS_PER_TOKEN);
+  }
+
+  /**
+   * Estimate total tokens for all messages
+   */
+  estimateTotalTokens(messages) {
+    if (!messages || !Array.isArray(messages)) return 0;
+    return messages.reduce((sum, msg) => sum + this.estimateMessageTokens(msg), 0);
+  }
+
+  /**
+   * Truncate messages to fit within the context limit
+   * Strategy: Keep system messages, always keep first and last user messages,
+   * and progressively remove older messages from the middle
+   */
+  truncateMessagesToFitLimit(body, log) {
+    if (!body?.messages) return body;
+
+    const messages = body.messages;
+    const estimatedTokens = this.estimateTotalTokens(messages);
+
+    if (estimatedTokens <= MAX_ALLOWED_TOKENS) {
+      return body; // No truncation needed
+    }
+
+    log?.warn("GITHUB", `Estimated tokens (${estimatedTokens}) exceed limit (${MAX_ALLOWED_TOKENS}). Truncating...`);
+
+    // Separate system messages from regular messages
+    const systemMessages = messages.filter(m => m.role === "system");
+    const regularMessages = messages.filter(m => m.role !== "system");
+
+    // We'll keep: all system messages + truncated regular messages
+    // Strategy: Keep first user message and last N messages that fit
+    let truncated = [];
+    let currentTokens = systemMessages.reduce((sum, m) => sum + this.estimateMessageTokens(m), 0);
+
+    // Always keep the first user message (usually contains the main request)
+    const firstUserMsg = regularMessages.find(m => m.role === "user");
+    if (firstUserMsg) {
+      truncated.push(firstUserMsg);
+      currentTokens += this.estimateMessageTokens(firstUserMsg);
+    }
+
+    // Add messages from the end until we approach the limit
+    // Leave some buffer for safety
+    const targetTokens = MAX_ALLOWED_TOKENS - 4000; // Extra safety buffer
+
+    for (let i = regularMessages.length - 1; i >= 0; i--) {
+      const msg = regularMessages[i];
+      if (msg === firstUserMsg) continue; // Skip if we already added it
+
+      const msgTokens = this.estimateMessageTokens(msg);
+
+      if (currentTokens + msgTokens <= targetTokens) {
+        truncated.unshift(msg);
+        currentTokens += msgTokens;
+      } else {
+        // Stop when adding this message would exceed the limit
+        break;
+      }
+    }
+
+    // Prepend system messages at the beginning
+    const result = {
+      ...body,
+      messages: [...systemMessages, ...truncated]
+    };
+
+    log?.info("GITHUB", `Truncated from ${messages.length} to ${result.messages.length} messages (estimated ${currentTokens} tokens)`);
+
+    return result;
+  }
+
   async execute(options) {
     const { model, log } = options;
 
@@ -79,11 +193,14 @@ export class GithubExecutor extends BaseExecutor {
       return this.executeWithResponsesEndpoint(options);
     }
 
+    // First truncate messages to fit within context limit, then sanitize
+    const truncatedBody = this.truncateMessagesToFitLimit(options.body, log);
+
     // Sanitize messages before sending to /chat/completions
     // This handles Claude models on GitHub Copilot which reject non-text/image_url content types
     const sanitizedOptions = {
       ...options,
-      body: this.sanitizeMessagesForChatCompletions(options.body)
+      body: this.sanitizeMessagesForChatCompletions(truncatedBody)
     };
 
     const result = await super.execute(sanitizedOptions);
@@ -96,16 +213,58 @@ export class GithubExecutor extends BaseExecutor {
         this.knownCodexModels.add(model);
         return this.executeWithResponsesEndpoint(options);
       }
+
+      // Handle token limit errors by aggressively truncating and retrying
+      if (errorBody.includes("exceeds the limit") || errorBody.includes("token")) {
+        log?.warn("GITHUB", `Token limit error from API: ${errorBody.substring(0, 200)}`);
+        // Already truncated above — this means our estimate was too generous
+        // Try with even more aggressive truncation
+        const aggressiveBody = this.aggressiveTruncate(truncatedBody, log);
+        const retryOptions = {
+          ...options,
+          body: this.sanitizeMessagesForChatCompletions(aggressiveBody)
+        };
+        return super.execute(retryOptions);
+      }
     }
 
     return result;
+  }
+
+  /**
+   * Aggressive truncation: keep only system + first user + last 10 messages
+   * Used as fallback when initial truncation wasn't enough
+   */
+  aggressiveTruncate(body, log) {
+    if (!body?.messages) return body;
+
+    const messages = body.messages;
+    const systemMessages = messages.filter(m => m.role === "system");
+    const regularMessages = messages.filter(m => m.role !== "system");
+
+    const firstUser = regularMessages.find(m => m.role === "user");
+    const lastMessages = regularMessages.slice(-10);
+
+    // Ensure we don't add firstUser twice
+    let result;
+    if (firstUser && !lastMessages.includes(firstUser)) {
+      result = [...systemMessages, firstUser, ...lastMessages];
+    } else {
+      result = [...systemMessages, ...lastMessages];
+    }
+
+    log?.warn("GITHUB", `Aggressive truncation: ${messages.length} → ${result.length} messages`);
+
+    return { ...body, messages: result };
   }
 
   async executeWithResponsesEndpoint({ model, body, stream, credentials, signal, log }) {
     const url = this.config.responsesUrl;
     const headers = this.buildHeaders(credentials, stream);
     
-    const transformedBody = openaiToOpenAIResponsesRequest(model, body, stream, credentials);
+    // Truncate messages before translation to fit within context limit
+    const truncatedBody = this.truncateMessagesToFitLimit(body, log);
+    const transformedBody = openaiToOpenAIResponsesRequest(model, truncatedBody, stream, credentials);
 
     log?.debug("GITHUB", "Sending translated request to /responses");
 
@@ -116,10 +275,35 @@ export class GithubExecutor extends BaseExecutor {
       signal
     });
 
+    // Handle token limit errors with aggressive truncation
+    if (!response.ok && response.status === HTTP_STATUS.BAD_REQUEST) {
+      const errorBody = await response.clone().text();
+      if (errorBody.includes("exceeds the limit") || errorBody.includes("token")) {
+        log?.warn("GITHUB", `Token limit error from /responses: ${errorBody.substring(0, 200)}`);
+        const aggressiveBody = this.aggressiveTruncate(truncatedBody, log);
+        const retryTransformed = openaiToOpenAIResponsesRequest(model, aggressiveBody, stream, credentials);
+        
+        const retryResponse = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(retryTransformed),
+          signal
+        });
+
+        if (retryResponse.ok) {
+          return this.buildResponseStream(retryResponse, model, url, headers, retryTransformed);
+        }
+      }
+    }
+
     if (!response.ok) {
       return { response, url, headers, transformedBody };
     }
 
+    return this.buildResponseStream(response, model, url, headers, transformedBody);
+  }
+
+  buildResponseStream(response, model, url, headers, transformedBody) {
     const state = initState("openai-responses");
     state.model = model;
 
