@@ -11,9 +11,15 @@ GitHub Copilot API has a 128K token limit. Long conversations would hit this lim
 
 Added automatic message truncation in `open-sse/executors/github.js`:
 - Token estimation using ~4 chars per token heuristic
-- Smart truncation keeping system messages, first user message, and recent history  
+- **Sliding window strategy**: keeps system messages + most recent messages only
 - Automatic retry with aggressive truncation on token limit errors
 - Applied to both `/chat/completions` and `/responses` endpoints
+
+### Why Sliding Window?
+
+Initial implementation kept "first user message + recent messages" which caused the model to see old context out of order and repeat itself with responses like "Let me look at the current state...". 
+
+The sliding window approach (system + most recent N messages) maintains natural conversation flow without confusing the model.
 
 ## Running Tests
 
@@ -102,13 +108,14 @@ estimateMessageTokens(message) {
 
 ### Truncation Strategy
 1. **Keep all system messages** (important context)
-2. **Keep first user message** (original request)
-3. **Keep recent messages** (current context)
-4. **Remove old middle messages** (less relevant history)
+2. **Keep most recent messages** (current conversation)
+3. **Remove old messages** (sliding window approach)
+
+This prevents the model from seeing disconnected old context that causes repetition.
 
 ### Aggressive Fallback
 If initial truncation fails:
-- Keep only: system + first user + last 10 messages
+- Keep only: system + last 10 messages
 - Guarantees under 12 messages total
 - Ensures request will succeed
 
